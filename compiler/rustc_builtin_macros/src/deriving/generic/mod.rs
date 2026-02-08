@@ -630,6 +630,49 @@ impl<'a> TraitDef<'a> {
         let ctxt = self.span.ctxt();
         let span = generics.span.with_ctxt(ctxt);
 
+        // Scan field types to find type params that only appear inside fn
+        // pointer types. Those params don't need derived bounds because fn
+        // pointers always implement all derivable traits.
+        let params_in_non_fnptr: rustc_data_structures::fx::FxHashSet<Symbol> = {
+            let ty_param_names: Vec<Symbol> = generics
+                .params
+                .iter()
+                .filter_map(|p| match &p.kind {
+                    GenericParamKind::Type { .. } => Some(p.ident.name),
+                    _ => None,
+                })
+                .collect();
+            if ty_param_names.is_empty() {
+                rustc_data_structures::fx::FxHashSet::default()
+            } else {
+                use rustc_ast::visit;
+                struct SkipFnPtrs<'a, 'b> {
+                    names: &'a [Symbol],
+                    found: &'b mut rustc_data_structures::fx::FxHashSet<Symbol>,
+                }
+                impl<'ast> visit::Visitor<'ast> for SkipFnPtrs<'_, '_> {
+                    fn visit_ty(&mut self, ty: &'ast ast::Ty) {
+                        if matches!(&ty.kind, ast::TyKind::FnPtr(_)) {
+                            return;
+                        }
+                        if let ast::TyKind::Path(_, path) = &ty.kind
+                            && let Some(seg) = path.segments.first()
+                            && self.names.contains(&seg.ident.name)
+                        {
+                            self.found.insert(seg.ident.name);
+                        }
+                        visit::walk_ty(self, ty);
+                    }
+                }
+                let mut found = rustc_data_structures::fx::FxHashSet::default();
+                for field_ty in &field_tys {
+                    let mut v = SkipFnPtrs { names: &ty_param_names, found: &mut found };
+                    visit::Visitor::visit_ty(&mut v, field_ty);
+                }
+                found
+            }
+        };
+
         // Create the generic parameters
         let params: ThinVec<_> = generics
             .params
@@ -640,37 +683,44 @@ impl<'a> TraitDef<'a> {
                     // Extra restrictions on the generics parameters to the
                     // type being derived upon.
                     let span = param.ident.span.with_ctxt(ctxt);
-                    let bounds: Vec<_> = self
-                        .additional_bounds
-                        .iter()
-                        .map(|p| {
-                            cx.trait_bound(p.to_path(cx, span, type_ident, generics), self.is_const)
-                        })
-                        .chain(
-                            // Add a bound for the current trait.
-                            self.skip_path_as_bound.not().then(|| {
-                                let mut trait_path = trait_path.clone();
-                                trait_path.span = span;
-                                cx.trait_bound(trait_path, self.is_const)
-                            }),
-                        )
-                        .chain({
-                            // Add a `Copy` bound if required.
-                            if is_packed && self.needs_copy_as_bound_if_packed {
-                                let p = deriving::path_std!(marker::Copy);
-                                Some(cx.trait_bound(
+                    let bounds: Vec<_> = if params_in_non_fnptr.contains(&param.ident.name) {
+                        self.additional_bounds
+                            .iter()
+                            .map(|p| {
+                                cx.trait_bound(
                                     p.to_path(cx, span, type_ident, generics),
                                     self.is_const,
-                                ))
-                            } else {
-                                None
-                            }
-                        })
-                        .chain(
-                            // Also add in any bounds from the declaration.
-                            param.bounds.iter().cloned(),
-                        )
-                        .collect();
+                                )
+                            })
+                            .chain(
+                                // Add a bound for the current trait.
+                                self.skip_path_as_bound.not().then(|| {
+                                    let mut trait_path = trait_path.clone();
+                                    trait_path.span = span;
+                                    cx.trait_bound(trait_path, self.is_const)
+                                }),
+                            )
+                            .chain({
+                                // Add a `Copy` bound if required.
+                                if is_packed && self.needs_copy_as_bound_if_packed {
+                                    let p = deriving::path_std!(marker::Copy);
+                                    Some(cx.trait_bound(
+                                        p.to_path(cx, span, type_ident, generics),
+                                        self.is_const,
+                                    ))
+                                } else {
+                                    None
+                                }
+                            })
+                            .chain(
+                                // Also add in any bounds from the declaration.
+                                param.bounds.iter().cloned(),
+                            )
+                            .collect()
+                    } else {
+                        // Type param only inside fn ptrs -- no derived bounds needed.
+                        param.bounds.iter().cloned().collect()
+                    };
 
                     cx.typaram(span, param.ident, bounds, None)
                 }
